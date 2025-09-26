@@ -1,0 +1,359 @@
+XR Origin
+Environment
+  ├─ Terrain (TerrainCollider)  ← fairway/rough/sand meshes OK too
+  ├─ Green (MeshCollider)
+  ├─ TeePad (BoxCollider)
+  ├─ WaterHazard (BoxCollider isTrigger)
+  └─ OutOfBounds (BoxCollider isTrigger)
+Gameplay
+  ├─ Ball (Rigidbody + SphereCollider + GolfBall.cs)
+  ├─ Club_Right (XR Grab Interactable + rigidbody + ClubHead.cs)
+  ├─ Club_Left  (optional)
+  ├─ Hole01
+  │   ├─ Cup (Cylinder + MeshCollider isTrigger + HoleCup.cs)
+  │   └─ Flag (SkinnedMesh or simple mesh + FlagWind.cs)
+  └─ Game (StrokeManager.cs)
+Audio
+  ├─ HitClack
+  ├─ CupRattle
+  └─ AmbientWind
+Layers/Tags (recommended)
+
+Layer GolfBall for the ball
+
+Layer Club for clubhead
+
+Physics settings
+
+Fixed Timestep: 0.0166667 (60 Hz)
+
+Default Solver Iterations: 12; Velocity Iterations: 6
+
+Rigidbody (Ball)
+
+Mass 0.045 kg (real golf ball)
+
+Drag 0.02, Angular Drag 0.05
+
+Interpolation Interpolate
+
+Collision Detection Continuous Dynamic
+
+Physic Materials
+
+Grass: Dynamic/Static Friction 0.8, Bounciness 0.02
+
+Green: Friction 0.3, Bounciness 0
+
+Fairway: Friction 0.6
+
+Sand: Friction 1.0, Combine = Multiply
+
+Assign to the respective colliders.
+
+C# scripts (drop into Assets/Scripts)
+ClubHead.cs
+Tracks clubhead velocity from frame to frame and provides a clean hit impulse to the ball on contact. Also sends optional haptics.
+
+csharp
+Copy code
+using UnityEngine;
+using UnityEngine.XR.Interaction.Toolkit;
+
+[RequireComponent(typeof(Collider))]
+[RequireComponent(typeof(Rigidbody))]
+public class ClubHead : MonoBehaviour
+{
+    [Header("Impact Tuning")]
+    [Tooltip("Base scale for converting clubhead speed (m/s) into impulse.")]
+    public float impulsePerMS = 0.55f;
+    [Tooltip("Extra boost when striking near the sweet spot.")]
+    public float sweetSpotBonus = 1.1f;
+    [Tooltip("Radius around sweet spot that grants bonus.")]
+    public float sweetSpotRadius = 0.05f;
+    [Tooltip("Maximum impulse clamp to avoid freak hits.")]
+    public float maxImpulse = 40f;
+
+    [Header("Sweet Spot")]
+    public Transform sweetSpot; // place at face center
+
+    [Header("Haptics (optional)")]
+    public XRBaseController rightController;
+    public XRBaseController leftController;
+    public float hapticAmplitude = 0.6f;
+    public float hapticDuration = 0.06f;
+
+    private Rigidbody rb;
+    private Vector3 lastPos;
+    private Vector3 velocityWS;
+
+    void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+        rb.isKinematic = false;
+        rb.useGravity = false; // club is hand-driven
+        lastPos = transform.position;
+    }
+
+    void Update()
+    {
+        // Estimate velocity independent of rigidbody (works with tracked hands)
+        velocityWS = (transform.position - lastPos) / Mathf.Max(Time.deltaTime, 0.0001f);
+        lastPos = transform.position;
+    }
+
+    public Vector3 GetHeadVelocity() => velocityWS;
+
+    void OnCollisionEnter(Collision col)
+    {
+        var ball = col.collider.GetComponent<GolfBall>();
+        if (ball == null) return;
+
+        // Approximate face normal: use club's forward (adjust if your mesh faces differently)
+        Vector3 faceNormal = transform.forward.normalized;
+        Vector3 v = GetHeadVelocity();
+
+        // Only count forward (striking) component
+        float speed = Vector3.Dot(v, faceNormal);
+        if (speed <= 0.2f) return; // ignore glancing/backward taps
+
+        // Sweet spot bonus
+        float bonus = 1f;
+        if (sweetSpot != null)
+        {
+            Vector3 contactPoint = col.GetContact(0).point;
+            if (Vector3.Distance(contactPoint, sweetSpot.position) <= sweetSpotRadius)
+                bonus = sweetSpotBonus;
+        }
+
+        float impulseMag = Mathf.Clamp(speed * impulsePerMS * bonus, 0f, maxImpulse);
+        Vector3 impulse = faceNormal * impulseMag;
+
+        // Optional side spin from clubhead lateral motion
+        Vector3 lateral = v - faceNormal * speed;
+        float spin = Mathf.Clamp(lateral.magnitude * 0.08f, 0f, 6f); // radians/sec add
+        Vector3 spinAxis = Vector3.Cross(faceNormal, lateral.normalized);
+
+        ball.Strike(impulse, spinAxis, spin);
+
+        PulseHaptics();
+    }
+
+    private void PulseHaptics()
+    {
+        if (rightController != null) rightController.SendHapticImpulse(hapticAmplitude, hapticDuration);
+        if (leftController  != null) leftController.SendHapticImpulse(hapticAmplitude, hapticDuration);
+    }
+}
+GolfBall.cs
+Handles rolling, spin, surface friction, putt capture, and water/OOB reset.
+
+csharp
+Copy code
+using UnityEngine;
+
+[RequireComponent(typeof(Rigidbody))]
+[RequireComponent(typeof(SphereCollider))]
+public class GolfBall : MonoBehaviour
+{
+    [Header("Roll")]
+    public float rollFriction = 0.03f; // artificial ground rolling resistance
+    public float stopThreshold = 0.06f;
+
+    [Header("Spin")]
+    public float spinDecay = 0.98f; // per second
+    public float liftFromBackspin = 0.0f; // keep 0 for simple play
+
+    [Header("Reset")]
+    public Transform teeSpawn;
+    public float waterSlowdown = 0.25f;
+
+    private Rigidbody rb;
+    private int strokes = 0;
+
+    void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+        rb.constraints = RigidbodyConstraints.None;
+        rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+    }
+
+    public void Strike(Vector3 impulse, Vector3 spinAxis, float spin)
+    {
+        strokes++;
+        rb.AddForce(impulse, ForceMode.Impulse);
+
+        if (spin > 0.0001f && spinAxis.sqrMagnitude > 0.0001f)
+        {
+            Vector3 angVel = spinAxis.normalized * spin;
+            rb.angularVelocity = rb.angularVelocity + angVel;
+        }
+    }
+
+    void FixedUpdate()
+    {
+        // Simple rolling resistance proportional to speed
+        Vector3 v = rb.velocity;
+        Vector3 horizontalV = new Vector3(v.x, 0f, v.z);
+        if (horizontalV.sqrMagnitude > 0.0001f)
+        {
+            Vector3 resist = -horizontalV.normalized * rollFriction;
+            rb.AddForce(resist, ForceMode.Acceleration);
+        }
+
+        // Spin decay
+        rb.angularVelocity *= Mathf.Pow(spinDecay, Time.fixedDeltaTime);
+
+        // Optional tiny lift from backspin (disabled by default)
+        if (liftFromBackspin > 0f)
+        {
+            float backspin = Vector3.Dot(rb.angularVelocity, Vector3.right); // placeholder
+            if (backspin > 0f)
+                rb.AddForce(Vector3.up * (backspin * liftFromBackspin), ForceMode.Force);
+        }
+
+        // Autostop near rest to avoid endless micro-rolling
+        if (rb.velocity.magnitude < stopThreshold && IsGrounded())
+        {
+            rb.velocity = Vector3.zero;
+            rb.angularVelocity = Vector3.zero;
+        }
+    }
+
+    private bool IsGrounded()
+    {
+        return Physics.Raycast(transform.position, Vector3.down, out _, 0.07f);
+    }
+
+    void OnTriggerEnter(Collider other)
+    {
+        if (other.CompareTag("Water"))
+        {
+            rb.velocity *= waterSlowdown;
+            Invoke(nameof(ResetToTee), 1.0f);
+        }
+        else if (other.CompareTag("OutOfBounds"))
+        {
+            Invoke(nameof(ResetToTee), 0.5f);
+        }
+    }
+
+    public void ResetToTee()
+    {
+        if (!teeSpawn) return;
+        rb.velocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+        transform.position = teeSpawn.position + Vector3.up * 0.03f;
+    }
+
+    public int GetStrokeCount() => strokes;
+    public void ResetStrokes() => strokes = 0;
+}
+HoleCup.cs
+Registers a sunk putt only when the ball is slow enough and fully inside the cup.
+
+csharp
+Copy code
+using UnityEngine;
+using UnityEngine.Events;
+
+public class HoleCup : MonoBehaviour
+{
+    [Tooltip("Ball speed (m/s) must be below this to count as holed.")]
+    public float captureSpeed = 2.0f;
+    [Tooltip("Vertical pull into cup once inside trigger.")]
+    public float capturePull = 4.0f;
+    public Transform cupCenter;
+    public AudioSource cupSound;
+    public UnityEvent onHoled;
+
+    private void OnTriggerStay(Collider other)
+    {
+        var ball = other.GetComponent<GolfBall>();
+        if (!ball) return;
+
+        Rigidbody rb = other.attachedRigidbody;
+        if (rb.velocity.magnitude <= captureSpeed)
+        {
+            // Pull to center and down
+            Vector3 toCenter = (cupCenter.position - other.transform.position);
+            rb.AddForce(toCenter.normalized * capturePull, ForceMode.Acceleration);
+
+            if (toCenter.magnitude < 0.05f)
+            {
+                // Consider holed
+                rb.velocity = Vector3.zero;
+                rb.angularVelocity = Vector3.zero;
+                other.transform.position = cupCenter.position - Vector3.up * 0.035f;
+                onHoled?.Invoke();
+                if (cupSound) cupSound.Play();
+            }
+        }
+    }
+}
+FlagWind.cs
+Simple physical-looking sway for the flag (works on pole or flag mesh root).
+
+csharp
+Copy code
+using UnityEngine;
+
+public class FlagWind : MonoBehaviour
+{
+    public float swayAmplitude = 6f;
+    public float swaySpeed = 0.8f;
+    public Vector3 baseEuler;
+
+    void Start() { baseEuler = transform.localEulerAngles; }
+
+    void Update()
+    {
+        float t = Time.time * swaySpeed;
+        float angle = Mathf.Sin(t) * swayAmplitude + Mathf.Sin(t * 0.47f) * (swayAmplitude * 0.4f);
+        Vector3 e = baseEuler;
+        e.y += angle;
+        transform.localEulerAngles = e;
+    }
+}
+StrokeManager.cs
+Counts strokes, handles UI prompts, next-hole logic.
+
+csharp
+Copy code
+using UnityEngine;
+using UnityEngine.Events;
+
+public class StrokeManager : MonoBehaviour
+{
+    public GolfBall ball;
+    public UnityEvent<int> onStrokesChanged;
+    public UnityEvent onHoleComplete;
+
+    private int strokesAtHoleStart = 0;
+
+    void Start()
+    {
+        strokesAtHoleStart = 0;
+        onStrokesChanged?.Invoke(0);
+    }
+
+    public void OnBallStruck()
+    {
+        onStrokesChanged?.Invoke(ball.GetStrokeCount());
+    }
+
+    public void OnHoleHoled()
+    {
+        int strokesThisHole = ball.GetStrokeCount() - strokesAtHoleStart;
+        Debug.Log($"Hole complete in {strokesThisHole} strokes");
+        onHoleComplete?.Invoke();
+        strokesAtHoleStart = ball.GetStrokeCount();
+    }
+}
+Hook it up:
+
+In HoleCup.onHoled, add a listener to StrokeManager.OnHoleHoled.
+
+In ClubHead.OnCollisionEnter, after ball.Strike(...), also call FindObjectOfType<StrokeManager>()?.OnBallStruck();
+
