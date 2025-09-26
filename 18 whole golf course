@@ -1,0 +1,473 @@
+using UnityEngine;
+using System.Collections.Generic;
+
+public class CourseGenerator : MonoBehaviour
+{
+    [Header("Seed & Sizes")]
+    public int seed = 12345;
+    public int terrainSize = 900;     // meters (x & z)
+    public int terrainHeight = 28;    // meters (y)
+    public int holesCount = 18;
+
+    [Header("Noise (Hills)")]
+    public float hillFrequency = 0.0035f;
+    public float hillAmplitude01 = 0.6f; // 0..1 then scaled by terrainHeight
+    public float hillOctaves = 3;
+
+    [Header("Hole Layout")]
+    public Vector2 minHoleSpan = new Vector2(120, 120);
+    public Vector2 maxHoleSpan = new Vector2(260, 260);
+    public float teeFlattenRadius = 7f;
+    public float greenRadius = 8f;
+    public float fairwayHalfWidth = 9f;
+    public float fairwaySegmentLen = 8f;
+
+    [Header("Surfaces (friction adds)")]
+    public float fairwayFrictionAdd = 0.01f;
+    public float greenFrictionAdd = -0.015f; // faster than base
+    public float roughFrictionAdd = 0.03f;
+    public float sandFrictionAdd = 0.06f;
+
+    [Header("Water & OOB")]
+    public int lakesToCarve = 3;
+    public float lakeRadiusMin = 12f;
+    public float lakeRadiusMax = 25f;
+
+    [Header("Trees")]
+    public int treeCount = 1200;
+    public float treeClearFromFairway = 12f;
+    public GameObject treePrefab; // if null, will create simple capsule+sphere
+
+    [Header("Prefabs (Gameplay)")]
+    public GameObject ballPrefab;
+    public GameObject clubRightPrefab;
+    public GameObject flagPrefab;  // simple pole/flag with FlagWind on it
+    public Material fairwayMat;
+    public Material greenMat;
+    public Material roughMat;
+    public Material sandMat;
+    public Material waterMat;
+
+    [Header("Managers")]
+    public StrokeManager strokeManager;
+    public SkyboxController skyboxController;
+
+    private Terrain terrain;
+    private TerrainData tData;
+    private List<Transform> teeSpawns = new();
+    private List<HoleCup> cups = new();
+    private System.Random rng;
+
+    void Start()
+    {
+        rng = new System.Random(seed);
+        GenerateTerrain();
+        Vector3[] holeCenters = LayoutHoles();
+        BuildHolesAndFairways(holeCenters);
+        CarveLakes();
+        PlantTrees(holeCenters);
+
+        SpawnPlayer(ballPrefab, clubRightPrefab);
+        HookupEvents();
+    }
+
+    void GenerateTerrain()
+    {
+        GameObject tGO = new GameObject("CourseTerrain");
+        tGO.transform.position = Vector3.zero;
+
+        tData = new TerrainData();
+        tData.heightmapResolution = 513;
+        tData.size = new Vector3(terrainSize, terrainHeight, terrainSize);
+
+        terrain = tGO.AddComponent<Terrain>();
+        terrain.terrainData = tData;
+        tGO.AddComponent<TerrainCollider>().terrainData = tData;
+
+        // Heights via fractal Perlin
+        int res = tData.heightmapResolution;
+        float[,] heights = new float[res, res];
+        for (int z = 0; z < res; z++)
+        {
+            for (int x = 0; x < res; x++)
+            {
+                float nx = (float)x / res;
+                float nz = (float)z / res;
+                float h = 0f;
+                float freq = hillFrequency * terrainSize;
+                float amp = hillAmplitude01;
+                for (int o = 0; o < hillOctaves; o++)
+                {
+                    h += Mathf.PerlinNoise((nx * terrainSize) * (freq * Mathf.Pow(2, o)) * 0.001f,
+                                           (nz * terrainSize) * (freq * Mathf.Pow(2, o)) * 0.001f) * amp;
+                    amp *= 0.5f;
+                }
+                h = Mathf.InverseLerp(0.2f, 1.2f, h);
+                heights[z, x] = Mathf.Clamp01(h * hillAmplitude01);
+            }
+        }
+        tData.SetHeights(0, 0, heights);
+    }
+
+    Vector3[] LayoutHoles()
+    {
+        // Snake a loose path across the terrain
+        var centers = new Vector3[holesCount];
+        float margin = 40f;
+        Vector3 start = new Vector3(margin, 0, margin);
+        centers[0] = TerrainPosToWorld(start);
+
+        for (int i = 1; i < holesCount; i++)
+        {
+            Vector2 span = new Vector2(
+                Mathf.Lerp(minHoleSpan.x, maxHoleSpan.x, (float)rng.NextDouble()),
+                Mathf.Lerp(minHoleSpan.y, maxHoleSpan.y, (float)rng.NextDouble())
+            );
+
+            Vector3 dir = (i % 2 == 0) ? Vector3.right : Vector3.forward;
+            if (i % 4 >= 2) dir = -dir;
+            Vector3 j = centers[i - 1] + new Vector3(dir.x * span.x, 0, dir.z * span.y);
+            j.x = Mathf.Clamp(j.x, 20, terrainSize - 20);
+            j.z = Mathf.Clamp(j.z, 20, terrainSize - 20);
+            centers[i] = new Vector3(j.x, 0, j.z);
+        }
+        return centers;
+    }
+
+    void BuildHolesAndFairways(Vector3[] centers)
+    {
+        var parent = new GameObject("Holes").transform;
+
+        for (int i = 0; i < centers.Length; i++)
+        {
+            // Tee & Cup positions
+            Vector3 tee = centers[i] + RandXZ(18f);
+            Vector3 cup = centers[i] + RandXZ(18f) + (RandXZ(1f).normalized * Mathf.Lerp(90, 190, (float)rng.NextDouble()));
+
+            tee = ClampToTerrain(tee);
+            cup = ClampToTerrain(cup);
+
+            FlattenCircle(tee, teeFlattenRadius, 0.01f);
+            FlattenCircle(cup, greenRadius + 2f, 0.008f);
+
+            // Visual decals
+            CreateDisc("Green_"+(i+1), cup, greenRadius, greenMat, parent);
+            CreateRibbonFairway("Fairway_"+(i+1), tee, cup, fairwayHalfWidth, fairwaySegmentLen, fairwayMat, parent);
+
+            // Surface volumes (affect ball roll)
+            CreateSurfaceDisc(cup, greenRadius, SurfaceType.Green, greenFrictionAdd);
+            CreateSurfaceRibbon(tee, cup, fairwayHalfWidth, fairwaySegmentLen, SurfaceType.Fairway, fairwayFrictionAdd);
+
+            // Sand bunkers near green
+            for (int b = 0; b < 2; b++)
+            {
+                Vector3 sb = cup + RandXZ(12f + (float)rng.NextDouble() * 6f);
+                CreateDisc("Bunker_"+i+"_"+b, sb, 5.5f, sandMat, parent);
+                CreateSurfaceDisc(sb, 5.5f, SurfaceType.Sand, sandFrictionAdd);
+                LowerCircle(sb, 5.5f, 0.7f);
+            }
+
+            // Cup + flag
+            var hole = new GameObject("Hole_"+(i+1));
+            hole.transform.parent = parent;
+
+            var cupGo = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            cupGo.name = "Cup";
+            cupGo.transform.SetParent(hole.transform);
+            cupGo.transform.position = new Vector3(cup.x, TerrainY(cup) + 0.02f, cup.z);
+            cupGo.transform.localScale = new Vector3(0.108f, 0.055f, 0.108f); // 108mm dia, 110mm deep visual
+            var cupCol = cupGo.GetComponent<CapsuleCollider>();
+            cupCol.isTrigger = true;
+
+            var holeCup = cupGo.AddComponent<HoleCup>();
+            holeCup.captureSpeed = 2f;
+            var center = new GameObject("CupCenter").transform;
+            center.SetParent(cupGo.transform);
+            center.localPosition = new Vector3(0, -0.05f, 0);
+            holeCup.cupCenter = center;
+            cups.Add(holeCup);
+
+            // Flag
+            GameObject flag = (flagPrefab != null) ? Instantiate(flagPrefab) : GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            flag.name = "Flag";
+            flag.transform.SetParent(hole.transform);
+            flag.transform.position = new Vector3(cup.x, TerrainY(cup) + 2.0f, cup.z);
+            flag.transform.localScale = new Vector3(0.03f, 2.0f, 0.03f);
+            if (flag.GetComponent<FlagWind>() == null) flag.AddComponent<FlagWind>();
+
+            // Tee spawn (for resets)
+            var teePad = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            teePad.name = "TeePad";
+            teePad.transform.position = new Vector3(tee.x, TerrainY(tee) + 0.02f, tee.z);
+            teePad.transform.localScale = new Vector3(2.0f, 0.04f, 2.0f);
+            teeSpawns.Add(teePad.transform);
+        }
+    }
+
+    void CarveLakes()
+    {
+        for (int i = 0; i < lakesToCarve; i++)
+        {
+            Vector3 c = new Vector3(
+                Mathf.Lerp(60, terrainSize - 60, (float)rng.NextDouble()),
+                0,
+                Mathf.Lerp(60, terrainSize - 60, (float)rng.NextDouble())
+            );
+            float r = Mathf.Lerp(lakeRadiusMin, lakeRadiusMax, (float)rng.NextDouble());
+            LowerCircle(c, r, 1.4f);
+
+            // Visual water disc
+            var w = CreateDisc("Lake_"+i, c, r, waterMat, null);
+            // Water zone
+            var z = w.AddComponent<SurfaceZone>();
+            z.type = SurfaceType.Water;
+            z.rollFrictionAdd = 0.0f;
+            z.onEnterVelocityMult = 0.25f;
+            z.causesReset = true;
+        }
+    }
+
+    void PlantTrees(Vector3[] centers)
+    {
+        var parent = new GameObject("Trees").transform;
+        for (int i = 0; i < treeCount; i++)
+        {
+            Vector3 p = new Vector3(
+                (float)rng.NextDouble() * (terrainSize - 10) + 5,
+                0,
+                (float)rng.NextDouble() * (terrainSize - 10) + 5
+            );
+            p.y = TerrainY(p);
+
+            // Avoid fairways/greens roughly by checking green discs list or ribbon bounds
+            if (Physics.OverlapSphere(new Vector3(p.x, p.y + 1f, p.z), treeClearFromFairway, ~0, QueryTriggerInteraction.Collide).Length > 0)
+                continue;
+
+            GameObject t = (treePrefab != null) ? Instantiate(treePrefab) : MakeSimpleTree();
+            t.name = "Tree";
+            t.transform.SetParent(parent);
+            t.transform.position = new Vector3(p.x, p.y, p.z);
+            t.transform.localScale = Vector3.one * Mathf.Lerp(0.8f, 1.6f, (float)rng.NextDouble());
+        }
+    }
+
+    void SpawnPlayer(GameObject ballPf, GameObject clubPf)
+    {
+        if (ballPf == null || clubPf == null || teeSpawns.Count == 0) return;
+
+        var firstTee = teeSpawns[0];
+        var ball = Instantiate(ballPf);
+        ball.name = "Ball";
+        ball.transform.position = firstTee.position + Vector3.up * 0.05f;
+        var gb = ball.GetComponent<GolfBall>();
+        gb.teeSpawn = firstTee;
+
+        var club = Instantiate(clubPf);
+        club.name = "Club_Right";
+        club.transform.position = firstTee.position + new Vector3(0.6f, 0.9f, 0.0f);
+    }
+
+    void HookupEvents()
+    {
+        if (strokeManager == null) return;
+        foreach (var c in cups)
+            c.onHoled.AddListener(strokeManager.OnHoleHoled);
+    }
+
+    // ===== Helpers =====
+    GameObject CreateDisc(string name, Vector3 center, float radius, Material mat, Transform parent)
+    {
+        var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        go.name = name;
+        if (parent != null) go.transform.SetParent(parent);
+        go.transform.position = new Vector3(center.x, TerrainY(center) + 0.01f, center.z);
+        go.transform.localScale = new Vector3(radius * 2f, 0.02f, radius * 2f);
+        var mr = go.GetComponent<MeshRenderer>();
+        if (mat) mr.sharedMaterial = mat;
+        var col = go.GetComponent<Collider>();
+        if (col) Destroy(col); // purely visual
+        return go;
+    }
+
+    void CreateRibbonFairway(string name, Vector3 start, Vector3 end, float halfWidth, float segLen, Material mat, Transform parent)
+    {
+        Vector3 a = start; a.y = TerrainY(a);
+        Vector3 b = end;   b.y = TerrainY(b);
+        Vector3 dir = (b - a);
+        float len = dir.magnitude;
+        int segments = Mathf.Max(2, Mathf.CeilToInt(len / segLen));
+        dir.Normalize();
+        Vector3 right = new Vector3(dir.z, 0, -dir.x);
+
+        var root = new GameObject(name).transform;
+        if (parent != null) root.SetParent(parent);
+
+        for (int i = 0; i <= segments; i++)
+        {
+            float t = i / (float)segments;
+            Vector3 c = Vector3.Lerp(a, b, t);
+            c.y = TerrainY(c) + 0.01f;
+
+            var quad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            quad.transform.SetParent(root);
+            quad.transform.position = c;
+            quad.transform.rotation = Quaternion.LookRotation(dir, Vector3.up);
+            quad.transform.localScale = new Vector3(halfWidth * 2f, segLen, 1f);
+
+            if (mat) quad.GetComponent<MeshRenderer>().sharedMaterial = mat;
+            Destroy(quad.GetComponent<Collider>());
+        }
+    }
+
+    void CreateSurfaceDisc(Vector3 center, float radius, SurfaceType type, float frictionAdd)
+    {
+        var go = new GameObject("Zone_"+type+"_Disc");
+        go.transform.position = new Vector3(center.x, TerrainY(center) + 0.5f, center.z);
+        var bc = go.AddComponent<SphereCollider>();
+        bc.isTrigger = true;
+        bc.radius = radius;
+        var z = go.AddComponent<SurfaceZone>();
+        z.type = type;
+        z.rollFrictionAdd = frictionAdd;
+        if (type == SurfaceType.Water) { z.onEnterVelocityMult = 0.25f; z.causesReset = true; }
+        if (type == SurfaceType.OutOfBounds) { z.causesReset = true; }
+    }
+
+    void CreateSurfaceRibbon(Vector3 start, Vector3 end, float halfWidth, float segLen, SurfaceType type, float frictionAdd)
+    {
+        Vector3 a = start; a.y = TerrainY(a) + 0.3f;
+        Vector3 b = end;   b.y = TerrainY(b) + 0.3f;
+        Vector3 dir = (b - a);
+        float len = dir.magnitude;
+        int segments = Mathf.Max(2, Mathf.CeilToInt(len / segLen));
+        dir.Normalize();
+
+        for (int i = 0; i <= segments; i++)
+        {
+            float t = i / (float)segments;
+            Vector3 c = Vector3.Lerp(a, b, t);
+            var box = new GameObject("Zone_"+type+"_Seg").AddComponent<BoxCollider>();
+            box.isTrigger = true;
+            box.transform.position = c;
+            box.transform.rotation = Quaternion.LookRotation(dir, Vector3.up);
+            box.size = new Vector3(halfWidth * 2f, 1.0f, segLen * 1.1f);
+
+            var z = box.gameObject.AddComponent<SurfaceZone>();
+            z.type = type;
+            z.rollFrictionAdd = frictionAdd;
+        }
+    }
+
+    void FlattenCircle(Vector3 worldCenter, float radius, float targetHeight01)
+    {
+        CircleHeights(worldCenter, radius, (x, z, h) => targetHeight01);
+    }
+
+    void LowerCircle(Vector3 worldCenter, float radius, float depth01)
+    {
+        CircleHeights(worldCenter, radius, (x, z, h) => Mathf.Clamp01(h - depth01 * 0.02f));
+    }
+
+    delegate float HeightFunc(int x, int z, float current01);
+    void CircleHeights(Vector3 worldCenter, float radius, HeightFunc hf)
+    {
+        int res = tData.heightmapResolution;
+        float[,] heights = tData.GetHeights(0, 0, res, res);
+
+        Vector2 c = new Vector2(worldCenter.x / terrainSize * (res - 1),
+                                worldCenter.z / terrainSize * (res - 1));
+        float r = radius / terrainSize * (res - 1);
+
+        int xmin = Mathf.Max(0, Mathf.FloorToInt(c.x - r));
+        int xmax = Mathf.Min(res - 1, Mathf.CeilToInt(c.x + r));
+        int zmin = Mathf.Max(0, Mathf.FloorToInt(c.y - r));
+        int zmax = Mathf.Min(res - 1, Mathf.CeilToInt(c.y + r));
+
+        for (int z = zmin; z <= zmax; z++)
+        {
+            for (int x = xmin; x <= xmax; x++)
+            {
+                float d = Vector2.Distance(new Vector2(x, z), c);
+                if (d <= r)
+                {
+                    float cur = heights[z, x];
+                    heights[z, x] = hf(x, z, cur);
+                }
+            }
+        }
+        tData.SetHeights(0, 0, heights);
+    }
+
+    Vector3 RandXZ(float r)
+    {
+        float ang = (float)rng.NextDouble() * Mathf.PI * 2f;
+        float rad = (float)rng.NextDouble() * r;
+        return new Vector3(Mathf.Cos(ang) * rad, 0, Mathf.Sin(ang) * rad);
+    }
+
+    float TerrainY(Vector3 p)
+    {
+        float h01 = terrain.terrainData.GetInterpolatedHeight(p.x / terrainSize, p.z / terrainSize) / terrainHeight;
+        return h01 * terrainHeight;
+    }
+
+    Vector3 TerrainPosToWorld(Vector3 xz)
+    {
+        return new Vector3(xz.x, TerrainY(xz), xz.z);
+    }
+
+    Vector3 ClampToTerrain(Vector3 p)
+    {
+        p.x = Mathf.Clamp(p.x, 5, terrainSize - 5);
+        p.z = Mathf.Clamp(p.z, 5, terrainSize - 5);
+        p.y = TerrainY(p);
+        return p;
+    }
+
+    GameObject MakeSimpleTree()
+    {
+        var root = new GameObject("SimpleTree");
+        var trunk = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        trunk.transform.SetParent(root.transform, false);
+        trunk.transform.localScale = new Vector3(0.25f, 2.2f, 0.25f);
+        trunk.transform.localPosition = new Vector3(0, 2.2f, 0);
+        var crown = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        crown.transform.SetParent(root.transform, false);
+        crown.transform.localScale = new Vector3(2.2f, 2.0f, 2.2f);
+        crown.transform.localPosition = new Vector3(0, 4.4f, 0);
+        Destroy(trunk.GetComponent<Collider>());
+        Destroy(crown.GetComponent<Collider>());
+        return root;
+    }
+}
+SkyboxController.cs
+Assign any cubemap/skybox material at runtime or swap later.
+
+csharp
+Copy code
+using UnityEngine;
+
+[ExecuteAlways]
+public class SkyboxController : MonoBehaviour
+{
+    [Tooltip("Drop any skybox material here (Procedural/Six-sided/Cubemap).")]
+    public Material skyboxMaterial;
+    [Range(0f, 8f)] public float exposure = 1f;
+    public Color ambientColor = Color.white;
+
+    void OnEnable() { Apply(); }
+    void OnValidate() { Apply(); }
+
+    public void Apply()
+    {
+        if (skyboxMaterial != null)
+            RenderSettings.skybox = skyboxMaterial;
+
+        DynamicGI.UpdateEnvironment();
+        RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
+        RenderSettings.ambientLight = ambientColor;
+        if (RenderSettings.skybox && RenderSettings.skybox.HasProperty("_Exposure"))
+            RenderSettings.skybox.SetFloat("_Exposure", exposure);
+    }
+}
+
